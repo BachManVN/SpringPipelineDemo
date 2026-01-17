@@ -1,0 +1,95 @@
+name: '[CD] Deploy to SIT'
+run-name: |
+  ${{ format('[CD] Deploy to SIT - Commit {0} by {1}', github.sha, github.actor) }}
+
+# DEPLOYMENT MODEL: Tag-based deployment
+# - Triggered when 'sit' branch is updated (force-pushed to point to a tag)
+# - Verifies 'sit' branch points to a deployable tag
+# - Simulates deployment to SIT environment (placeholder for actual deployment)
+# - SIT branch is a deployment pointer, not a code source
+
+on:
+  push:
+    branches:
+      - sit
+
+env:
+  JAVA_VERSION: '17'
+
+jobs:
+  deploy-sit:
+    name: Deploy to SIT
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    environment:
+      name: sit
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for tag verification
+
+      - name: Verify tag at HEAD
+        id: verify-tag
+        run: |
+          TAG_AT_HEAD=$(git describe --tags --exact-match HEAD 2>/dev/null || echo "")
+          
+          if [ -z "$TAG_AT_HEAD" ]; then
+            echo "❌ ERROR: SIT branch must point to a deployable tag"
+            echo "   To deploy: git checkout <TAG> && git checkout -B sit && git push origin sit --force"
+            exit 1
+          fi
+          
+          echo "✅ Deploying tag: $TAG_AT_HEAD"
+          echo "tag=$TAG_AT_HEAD" >> $GITHUB_OUTPUT
+          echo "commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Run Maven tests
+        run: mvn test
+
+      - name: Build application
+        run: |
+          echo "🔨 Building application from tag ${{ steps.verify-tag.outputs.tag }}..."
+          mvn clean package -DskipTests
+
+      - name: Prepare deployment package
+        run: |
+          mkdir -p deploy
+          JAR_FILE=$(find target -name "*.jar" -not -name "*-sources.jar" -not -name "*-javadoc.jar" | head -1)
+          
+          if [ -z "$JAR_FILE" ] || ! cp "$JAR_FILE" deploy/app.jar; then
+            echo "❌ ERROR: Failed to prepare deployment package"
+            exit 1
+          fi
+          
+          echo "✅ Deployment package prepared: deploy/app.jar"
+          echo "📦 JAR size: $(du -h deploy/app.jar | cut -f1)"
+
+      - name: Simulate deployment to SIT
+        run: |
+          echo "🚀 [PLACEHOLDER] Deploying to SIT environment..."
+          echo "   Tag: ${{ steps.verify-tag.outputs.tag }}"
+          echo "   Commit: ${{ steps.verify-tag.outputs.commit }}"
+          echo "   Environment: SIT"
+          echo "   Package: deploy/app.jar"
+          echo "   Profile: sit"
+          echo ""
+          echo "✅ [PLACEHOLDER] Deployment to SIT completed successfully"
+          echo "   In a real scenario, this would deploy to Azure App Service or similar platform"
+
+      - name: Simulate health check
+        run: |
+          echo "🔍 [PLACEHOLDER] Verifying SIT deployment health..."
+          sleep 2
+          echo "✅ [PLACEHOLDER] Health check passed"
+          echo "   Endpoint: /actuator/health"
+          echo "   Status: UP"

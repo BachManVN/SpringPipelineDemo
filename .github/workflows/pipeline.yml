@@ -1,0 +1,63 @@
+---
+name: '[Docs] Manual Deployment Helper'
+run-name: |
+  ${{ format('[Docs] Manual Deployment Helper - {0} by {1}', github.ref_name, github.actor) }}
+
+# DEPLOYMENT MODEL: Tag-based deployment
+# - Each environment has its own workflow triggered by branch push
+# - Branches are deployment pointers, not code sources
+# - Only tags are deployable artifacts
+#
+# NOTE: This workflow is a MANUAL DEPLOYMENT HELPER (documentation only)
+# WHY: It provides instructions for manual deployments but does NOT deploy
+# WHY: Actual deployments are handled by: deploy-sit.yml, deploy-uat.yml, deploy-prod.yml
+
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: 'Environment to deploy (for manual triggers)'
+        required: false
+        type: choice
+        options:
+          - sit
+          - uat
+          - prod
+      tag:
+        description: 'Tag to deploy (required)'
+        required: true
+        type: string
+
+jobs:
+  manual-deploy:
+    name: Manual Deployment Helper
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Deployment instructions
+        run: |
+          echo "📋 Manual Deployment Instructions"
+          echo ""
+          echo "Tag-based deployment model:"
+          echo ""
+          echo "To deploy to SIT:"
+          echo "  1. git checkout ${{ inputs.tag }}"
+          echo "  2. git checkout -B sit"
+          echo "  3. git push origin sit --force"
+          echo ""
+          echo "To deploy to UAT:"
+          echo "  1. git checkout ${{ inputs.tag }}"
+          echo "  2. git checkout -B uat"
+          echo "  3. git push origin uat --force"
+          echo ""
+          echo "To deploy to PROD:"
+          echo "  1. First deploy to UAT (see above)"
+          echo "  2. Test in UAT"
+          echo "  3. Create PR: uat → prod"
+          echo "  4. After PR approval, prod will deploy from UAT branch"
+          echo ""
+          echo "Hotfix workflow:"
+          echo "  1. Create hotfix branch from tag: git checkout <TAG> && git checkout -b hotfix/INC-123"
+          echo "  2. Implement fix and push"
+          echo "  3. Open PR: hotfix/INC-123 → hotfix"
+          echo "  4. After PR merge, CI creates hotfix tag automatically"

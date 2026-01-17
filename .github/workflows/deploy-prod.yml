@@ -1,0 +1,117 @@
+name: '[CD] Deploy to Production'
+run-name: |
+  ${{ format('[CD] Deploy to Production - Commit {0} by {1}', github.sha, github.actor) }}
+
+# DEPLOYMENT MODEL: Hybrid approval + tag-based deployment
+# - Triggered when 'prod' branch is updated (after PR: uat → prod is merged)
+# - CRITICAL: Deploys from UAT branch, NOT from prod branch
+# - This ensures production deploys the exact version tested in UAT
+# - Prod branch is approval-only, never used as code source
+
+on:
+  push:
+    branches:
+      - prod
+
+env:
+  JAVA_VERSION: '17'
+
+jobs:
+  deploy-prod:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    environment:
+      name: production
+
+    steps:
+      - name: Checkout UAT branch
+        id: checkout
+        uses: actions/checkout@v4
+        with:
+          # CRITICAL: Deploy from UAT branch, NOT from prod branch
+          # WHY: Production must deploy the exact tag tested in UAT (hybrid deployment model)
+          # The prod branch is approval-only, never used as code source
+          ref: uat
+          fetch-depth: 0
+
+      - name: Verify UAT branch points to tag
+        id: verify-tag
+        run: |
+          if [ "$(git rev-parse --abbrev-ref HEAD)" != "uat" ]; then
+            echo "❌ ERROR: Must deploy from UAT branch, not prod"
+            exit 1
+          fi
+          
+          TAG_AT_HEAD=$(git describe --tags --exact-match HEAD 2>/dev/null || echo "")
+          
+          if [ -z "$TAG_AT_HEAD" ]; then
+            echo "❌ ERROR: UAT branch must point to a deployable tag"
+            exit 1
+          fi
+          
+          echo "✅ Deploying tag: $TAG_AT_HEAD (from UAT branch)"
+          echo "tag=$TAG_AT_HEAD" >> $GITHUB_OUTPUT
+          echo "commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Run Maven tests
+        run: mvn test
+
+      - name: Build application
+        run: |
+          echo "🔨 Building application from tag ${{ steps.verify-tag.outputs.tag }}..."
+          mvn clean package -DskipTests
+
+      - name: Prepare deployment package
+        run: |
+          mkdir -p deploy
+          JAR_FILE=$(find target -name "*.jar" -not -name "*-sources.jar" -not -name "*-javadoc.jar" | head -1)
+          
+          if [ -z "$JAR_FILE" ] || ! cp "$JAR_FILE" deploy/app.jar; then
+            echo "❌ ERROR: Failed to prepare deployment package"
+            exit 1
+          fi
+          
+          echo "✅ Deployment package prepared: deploy/app.jar"
+          echo "📦 JAR size: $(du -h deploy/app.jar | cut -f1)"
+
+      - name: Simulate deployment to Production
+        run: |
+          echo "🚀 [PLACEHOLDER] Deploying to Production environment..."
+          echo "   Tag: ${{ steps.verify-tag.outputs.tag }}"
+          echo "   Commit: ${{ steps.verify-tag.outputs.commit }}"
+          echo "   Environment: Production"
+          echo "   Package: deploy/app.jar"
+          echo "   Profile: prod"
+          echo "   Deployed from: UAT branch (same version tested)"
+          echo ""
+          echo "✅ [PLACEHOLDER] Deployment to Production completed successfully"
+          echo "   In a real scenario, this would deploy to Azure App Service or similar platform"
+
+      - name: Simulate production health check
+        run: |
+          echo "🔍 [PLACEHOLDER] Verifying Production deployment health..."
+          sleep 2
+          echo "✅ [PLACEHOLDER] Production health check passed"
+          echo "   Endpoint: /actuator/health"
+          echo "   Status: UP"
+
+      - name: Post deployment notification
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "✅ PRODUCTION deployment completed"
+            echo "   Tag: ${{ steps.verify-tag.outputs.tag }}"
+            echo "   Commit: ${{ steps.verify-tag.outputs.commit }}"
+            echo "   Deployed from: UAT branch (same version tested)"
+          else
+            echo "❌ PRODUCTION deployment failed"
+          fi
