@@ -33,6 +33,11 @@ jobs:
           fetch-depth: 0  # Fetch all history for tag detection
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
       - name: Fetch all tags
         run: |
           echo "📥 Fetching all tags from remote..."
