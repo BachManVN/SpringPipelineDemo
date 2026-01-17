@@ -22,7 +22,6 @@ on:
 
 env:
   JAVA_VERSION: '17'
-  ENABLE_PROD_APPROVAL_GATE: ${{ vars.ENABLE_PROD_APPROVAL_GATE || 'false' }}
 
 jobs:
   deploy-uat:
@@ -110,16 +109,15 @@ jobs:
           echo "   Endpoint: /actuator/health"
           echo "   Status: UP"
 
-  deploy-prod:
-    name: Deploy to Production
+  deploy-prod-with-approval:
+    name: Deploy to Production (with approval)
     runs-on: ubuntu-latest
     needs: deploy-uat
-    if: success()
+    if: vars.ENABLE_PROD_APPROVAL_GATE == 'true'
     permissions:
       contents: read
     environment:
-      name: ${{ env.ENABLE_PROD_APPROVAL_GATE == 'true' && 'production' || 'production-auto' }}
-
+      name: production
     steps:
       - name: Checkout code (for tag verification)
         uses: actions/checkout@v4
@@ -146,7 +144,7 @@ jobs:
 
       - name: Simulate deployment to Production
         run: |
-          echo "🚀 [PLACEHOLDER] Deploying to Production environment..."
+          echo "🚀 [PLACEHOLDER] Deploying to Production environment (with approval gate)..."
           echo "   Tag: ${{ steps.verify-tag.outputs.tag }}"
           echo "   Environment: Production"
           echo "   Package: deploy/app.jar (reused from UAT)"
@@ -168,7 +166,71 @@ jobs:
         if: always()
         run: |
           if [ "${{ job.status }}" = "success" ]; then
-            echo "✅ PRODUCTION deployment completed"
+            echo "✅ PRODUCTION deployment completed (with approval)"
+            echo "   Tag: ${{ steps.verify-tag.outputs.tag }}"
+            echo "   Artifact: Reused from UAT deployment"
+          else
+            echo "❌ PRODUCTION deployment failed"
+          fi
+
+  deploy-prod-auto:
+    name: Deploy to Production (auto)
+    runs-on: ubuntu-latest
+    needs: deploy-uat
+    if: vars.ENABLE_PROD_APPROVAL_GATE != 'true'
+    permissions:
+      contents: read
+    environment:
+      name: production-auto
+    steps:
+      - name: Checkout code (for tag verification)
+        uses: actions/checkout@v4
+        with:
+          ref: uat
+          fetch-depth: 0
+
+      - name: Verify tag
+        id: verify-tag
+        run: |
+          TAG_AT_HEAD=$(git describe --tags --exact-match HEAD 2>/dev/null || echo "")
+          if [ -z "$TAG_AT_HEAD" ]; then
+            echo "❌ ERROR: UAT branch must point to a deployable tag"
+            exit 1
+          fi
+          echo "✅ Deploying to production: $TAG_AT_HEAD"
+          echo "tag=$TAG_AT_HEAD" >> $GITHUB_OUTPUT
+
+      - name: Download deployment artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-jar
+          path: deploy/
+
+      - name: Simulate deployment to Production
+        run: |
+          echo "🚀 [PLACEHOLDER] Deploying to Production environment (auto, no approval)..."
+          echo "   Tag: ${{ steps.verify-tag.outputs.tag }}"
+          echo "   Environment: Production"
+          echo "   Package: deploy/app.jar (reused from UAT)"
+          echo "   Profile: prod"
+          echo "   Artifact: Same JAR as UAT deployment"
+          echo ""
+          echo "✅ [PLACEHOLDER] Deployment to Production completed successfully"
+          echo "   In a real scenario, this would deploy to Azure App Service or similar platform"
+
+      - name: Simulate production health check
+        run: |
+          echo "🔍 [PLACEHOLDER] Verifying Production deployment health..."
+          sleep 2
+          echo "✅ [PLACEHOLDER] Production health check passed"
+          echo "   Endpoint: /actuator/health"
+          echo "   Status: UP"
+
+      - name: Post deployment notification
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "✅ PRODUCTION deployment completed (auto)"
             echo "   Tag: ${{ steps.verify-tag.outputs.tag }}"
             echo "   Artifact: Reused from UAT deployment"
           else

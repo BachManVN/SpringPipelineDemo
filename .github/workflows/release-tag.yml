@@ -35,6 +35,11 @@ jobs:
           fi
           echo "✅ Workflow triggered by main branch push"
 
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
       - name: Determine next release version
         id: version
         run: |
