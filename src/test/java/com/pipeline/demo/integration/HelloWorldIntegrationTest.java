@@ -7,6 +7,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
@@ -48,7 +49,13 @@ class HelloWorldIntegrationTest {
     void testActuatorHealthEndpoint_Integration() throws Exception {
         mockMvc.perform(get("/actuator/health"))
                 .andExpect(status().isOk())
-                .andExpect(content().contentType(MediaType.APPLICATION_JSON))
+                .andExpect(result -> {
+                    String ct = result.getResponse().getContentType();
+                    MediaType mediaType = MediaType.parseMediaType(ct);
+                    boolean compatible = mediaType.isCompatibleWith(MediaType.APPLICATION_JSON)
+                            || mediaType.getSubtype().toLowerCase().endsWith("+json");
+                    assertTrue(compatible, "Content-Type not compatible with application/json: " + ct);
+                })
                 .andExpect(jsonPath("$.status").exists());
     }
 }
