@@ -1,0 +1,176 @@
+name: '[CD] Deploy to UAT and Production'
+run-name: |
+  ${{ format('[CD] Deploy to UAT and Production - Commit {0} by {1}', github.sha, github.actor) }}
+
+# DEPLOYMENT MODEL: Unified UAT → Production pipeline
+# - Triggered when 'uat' branch is updated (force-pushed to point to a tag)
+# - Step 1: Deploy to UAT environment
+# - Step 2: Pause for approval (if ENABLE_PROD_APPROVAL_GATE is enabled)
+# - Step 3: Deploy same artifact to Production (reuses UAT build)
+# - WHY: Ensures production uses exact same artifact tested in UAT
+#
+# CONFIGURATION:
+# - Set GitHub variable: ENABLE_PROD_APPROVAL_GATE = "true" to enable approval gate
+# - When enabled: Requires approval in GitHub environment "production"
+# - When disabled: Automatically continues to production (GitHub Free compatible)
+# - Artifact reuse: Production deployment reuses the JAR built for UAT
+
+on:
+  push:
+    branches:
+      - uat
+
+env:
+  JAVA_VERSION: '17'
+  ENABLE_PROD_APPROVAL_GATE: ${{ vars.ENABLE_PROD_APPROVAL_GATE || 'false' }}
+
+jobs:
+  deploy-uat:
+    name: Deploy to UAT
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    environment:
+      name: uat
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for tag verification
+
+      - name: Verify tag at HEAD
+        id: verify-tag
+        run: |
+          TAG_AT_HEAD=$(git describe --tags --exact-match HEAD 2>/dev/null || echo "")
+          
+          if [ -z "$TAG_AT_HEAD" ]; then
+            echo "❌ ERROR: UAT branch must point to a deployable tag"
+            echo "   To deploy: git checkout <TAG> && git checkout -B uat && git push origin uat --force"
+            exit 1
+          fi
+          
+          echo "✅ Deploying tag: $TAG_AT_HEAD"
+          echo "tag=$TAG_AT_HEAD" >> $GITHUB_OUTPUT
+          echo "commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Run Maven tests
+        run: mvn test
+
+      - name: Build application
+        run: |
+          echo "🔨 Building application from tag ${{ steps.verify-tag.outputs.tag }}..."
+          mvn clean package -DskipTests
+
+      - name: Prepare deployment package
+        run: |
+          mkdir -p deploy
+          JAR_FILE=$(find target -name "*.jar" -not -name "*-sources.jar" -not -name "*-javadoc.jar" | head -1)
+          
+          if [ -z "$JAR_FILE" ] || ! cp "$JAR_FILE" deploy/app.jar; then
+            echo "❌ ERROR: Failed to prepare deployment package"
+            exit 1
+          fi
+          
+          echo "✅ Deployment package prepared: deploy/app.jar"
+          echo "📦 JAR size: $(du -h deploy/app.jar | cut -f1)"
+
+      - name: Upload deployment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-jar
+          path: deploy/app.jar
+          retention-days: 1
+          compression-level: 0  # JAR is already compressed
+
+      - name: Simulate deployment to UAT
+        run: |
+          echo "🚀 [PLACEHOLDER] Deploying to UAT environment..."
+          echo "   Tag: ${{ steps.verify-tag.outputs.tag }}"
+          echo "   Commit: ${{ steps.verify-tag.outputs.commit }}"
+          echo "   Environment: UAT"
+          echo "   Package: deploy/app.jar"
+          echo "   Profile: uat"
+          echo ""
+          echo "✅ [PLACEHOLDER] Deployment to UAT completed successfully"
+          echo "   In a real scenario, this would deploy to Azure App Service or similar platform"
+
+      - name: Simulate UAT health check
+        run: |
+          echo "🔍 [PLACEHOLDER] Verifying UAT deployment health..."
+          sleep 2
+          echo "✅ [PLACEHOLDER] UAT health check passed"
+          echo "   Endpoint: /actuator/health"
+          echo "   Status: UP"
+
+  deploy-prod:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: deploy-uat
+    if: success()
+    permissions:
+      contents: read
+    environment:
+      name: ${{ env.ENABLE_PROD_APPROVAL_GATE == 'true' && 'production' || 'production-auto' }}
+
+    steps:
+      - name: Checkout code (for tag verification)
+        uses: actions/checkout@v4
+        with:
+          ref: uat
+          fetch-depth: 0
+
+      - name: Verify tag
+        id: verify-tag
+        run: |
+          TAG_AT_HEAD=$(git describe --tags --exact-match HEAD 2>/dev/null || echo "")
+          if [ -z "$TAG_AT_HEAD" ]; then
+            echo "❌ ERROR: UAT branch must point to a deployable tag"
+            exit 1
+          fi
+          echo "✅ Deploying to production: $TAG_AT_HEAD"
+          echo "tag=$TAG_AT_HEAD" >> $GITHUB_OUTPUT
+
+      - name: Download deployment artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-jar
+          path: deploy/
+
+      - name: Simulate deployment to Production
+        run: |
+          echo "🚀 [PLACEHOLDER] Deploying to Production environment..."
+          echo "   Tag: ${{ steps.verify-tag.outputs.tag }}"
+          echo "   Environment: Production"
+          echo "   Package: deploy/app.jar (reused from UAT)"
+          echo "   Profile: prod"
+          echo "   Artifact: Same JAR as UAT deployment"
+          echo ""
+          echo "✅ [PLACEHOLDER] Deployment to Production completed successfully"
+          echo "   In a real scenario, this would deploy to Azure App Service or similar platform"
+
+      - name: Simulate production health check
+        run: |
+          echo "🔍 [PLACEHOLDER] Verifying Production deployment health..."
+          sleep 2
+          echo "✅ [PLACEHOLDER] Production health check passed"
+          echo "   Endpoint: /actuator/health"
+          echo "   Status: UP"
+
+      - name: Post deployment notification
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "✅ PRODUCTION deployment completed"
+            echo "   Tag: ${{ steps.verify-tag.outputs.tag }}"
+            echo "   Artifact: Reused from UAT deployment"
+          else
+            echo "❌ PRODUCTION deployment failed"
+          fi

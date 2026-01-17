@@ -1,0 +1,112 @@
+# CI Pipeline - Runs ONLY on PRs to main and hotfix branches
+# WHY: CI validates code quality before merge, not on deployment branches
+name: '[CI] Build and Test'
+run-name: |
+  ${{ format('[CI] Build and Test - PR #{0} → {1} by {2}', github.event.pull_request.number, github.base_ref, github.actor) }}
+
+on:
+  pull_request:
+    branches:
+      - main
+      - hotfix
+  # CRITICAL: CI does NOT run on sit/uat branches
+  # WHY: sit/uat are deployment pointer branches, not code sources
+  # WHY: CI should only validate code before merge, not on deployment branches
+
+env:
+  JAVA_VERSION: '17'
+  MAVEN_VERSION: '3.9.6'
+
+permissions:
+  contents: read
+  # CRITICAL: CI has read-only permissions
+  # WHY: CI should NEVER deploy or create tags - only validate code quality
+
+jobs:
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Compile code
+        run: |
+          echo "🔨 Compiling application..."
+          mvn clean compile -DskipTests
+
+      - name: Run unit tests
+        run: |
+          echo "🧪 Running unit tests..."
+          mvn clean test
+
+      - name: Run integration tests and check coverage
+        run: |
+          echo "🧪 Running integration tests and coverage check..."
+          mvn package
+          COVERAGE_THRESHOLD=$(mvn help:evaluate -Dexpression=coverage.minimum -q -DforceStdout)
+          COVERAGE_PERCENT=$(awk "BEGIN {printf \"%.0f\", $COVERAGE_THRESHOLD * 100}")
+          echo "📊 Coverage threshold: ${COVERAGE_PERCENT}%"
+          mvn verify || {
+            EXIT_CODE=$?
+            echo "❌ Tests or coverage check failed (exit code: $EXIT_CODE)"
+            exit $EXIT_CODE
+          }
+          echo "✅ Integration tests and coverage check passed"
+
+      - name: Generate JaCoCo coverage report (if not already generated)
+        if: always()
+        run: |
+          if [ ! -f "target/site/jacoco/jacoco.xml" ]; then
+            echo "Generating JaCoCo coverage report..."
+            mvn jacoco:report || echo "WARNING: Coverage report generation failed (non-critical)"
+          else
+            echo "Coverage report already generated during verify phase"
+          fi
+
+      - name: Display coverage summary
+        if: always()
+        run: |
+          if [ -f "target/site/jacoco/jacoco.xml" ]; then
+            echo "Coverage report generated successfully"
+            echo "View detailed report: target/site/jacoco/index.html"
+          else
+            echo "Coverage report not found"
+          fi
+
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: target/site/jacoco/index.html
+          retention-days: 30
+
+      - name: Upload coverage XML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: target/site/jacoco/jacoco.xml
+          retention-days: 30
+
+      - name: Build JAR
+        run: |
+          echo "🔨 Building application JAR..."
+          mvn clean package -DskipTests
+          echo "✅ Build completed"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: application-jar
+          path: target/*.jar
+          retention-days: 7

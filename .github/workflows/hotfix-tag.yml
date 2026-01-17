@@ -1,0 +1,109 @@
+name: '[Release] Create Hotfix Tag'
+run-name: |
+  ${{ format('[Release] Create Hotfix Tag - Hotfix branch push by {0}', github.actor) }}
+
+# CRITICAL: This is the ONLY place hotfix tags are created
+# WHY: CI must be the only tag creator to ensure consistency and prevent conflicts
+#
+# HOTFIX WORKFLOW:
+# 1. Checkout an older release tag (e.g., v1.4.0 when latest is v1.6.0)
+# 2. Create fix branch: git checkout v1.4.0 && git checkout -b fix-bug-1.4.0
+# 3. Make fixes, test on SIT, then create PR: fix-bug-1.4.0 → hotfix
+# 4. When PR is merged to hotfix branch, this workflow triggers
+# 5. Workflow detects base tag (v1.4.0) and creates hotfix tag (v1.4.1)
+
+on:
+  push:
+    branches:
+      - hotfix
+
+env:
+  JAVA_VERSION: '17'
+
+jobs:
+  create-hotfix-tag:
+    name: Create Hotfix Tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Required to create tags
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for tag detection
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch all tags
+        run: |
+          echo "📥 Fetching all tags from remote..."
+          git fetch --tags --force
+
+      - name: Verify hotfix branch requirements
+        run: |
+          CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          if [ "$CURRENT_BRANCH" != "hotfix" ]; then
+            echo "❌ ERROR: This workflow should only run on 'hotfix' branch"
+            exit 1
+          fi
+          echo "✅ Verified hotfix branch"
+
+      - name: Find base tag for hotfix
+        id: find-base-tag
+        run: |
+          BASE_TAG=""
+          for i in $(seq 0 10); do
+            TAG=$(git describe --tags --abbrev=0 HEAD~$i 2>/dev/null || echo "")
+            if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              BASE_TAG="$TAG"
+              break
+            fi
+          done
+          
+          if [ -z "$BASE_TAG" ]; then
+            echo "❌ ERROR: Cannot determine base tag for hotfix"
+            exit 1
+          fi
+          
+          echo "BASE_TAG=$BASE_TAG" >> $GITHUB_ENV
+          echo "✅ Base tag: $BASE_TAG"
+
+      - name: Calculate hotfix version
+        id: calculate-version
+        run: |
+          BASE_TAG="${{ env.BASE_TAG }}"
+          
+          if [[ ! "$BASE_TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "❌ ERROR: Invalid base tag format: $BASE_TAG"
+            exit 1
+          fi
+          
+          MAJOR="${BASH_REMATCH[1]}"
+          MINOR="${BASH_REMATCH[2]}"
+          PATCH="${BASH_REMATCH[3]}"
+          
+          NEW_PATCH=$((PATCH + 1))
+          HOTFIX_TAG="v${MAJOR}.${MINOR}.${NEW_PATCH}"
+          
+          echo "HOTFIX_TAG=$HOTFIX_TAG" >> $GITHUB_ENV
+          echo "✅ Hotfix version: $HOTFIX_TAG (from $BASE_TAG)"
+
+      - name: Create and push hotfix tag
+        run: |
+          HOTFIX_TAG="${{ env.HOTFIX_TAG }}"
+          
+          # Check if tag already exists
+          if git rev-parse "$HOTFIX_TAG" >/dev/null 2>&1; then
+            EXISTING_COMMIT=$(git rev-parse "$HOTFIX_TAG")
+            CURRENT_COMMIT=$(git rev-parse HEAD)
+            if [ "$EXISTING_COMMIT" != "$CURRENT_COMMIT" ]; then
+              echo "❌ ERROR: Tag $HOTFIX_TAG already exists and points to different commit"
+              exit 1
+            fi
+            echo "✅ Tag $HOTFIX_TAG already exists at current commit"
+            exit 0
+          fi
+          
+          echo "📦 Creating annotated hotfix tag: $HOTFIX_TAG"
+          git tag -a "$HOTFIX_TAG" -m "Hotfix $HOTFIX_TAG"
+          git push origin "$HOTFIX_TAG"
+          echo "✅ Hotfix tag $HOTFIX_TAG created and pushed"
