@@ -31,20 +31,27 @@ jobs:
         with:
           fetch-depth: 0  # Fetch all history for tag verification
 
-      - name: Verify tag at HEAD
-        id: verify-tag
+      - name: Verify deployment source
+        id: verify-source
         run: |
+          COMMIT=$(git rev-parse HEAD)
+          COMMIT_SHORT=$(git rev-parse --short HEAD)
+          
+          # Check if HEAD is a tag (preferred, but not required for SIT)
           TAG_AT_HEAD=$(git describe --tags --exact-match HEAD 2>/dev/null || echo "")
           
-          if [ -z "$TAG_AT_HEAD" ]; then
-            echo "❌ ERROR: SIT branch must point to a deployable tag"
-            echo "   To deploy: git checkout <TAG> && git checkout -B sit && git push origin sit --force"
-            exit 1
+          if [ -n "$TAG_AT_HEAD" ]; then
+            echo "✅ Deploying tag: $TAG_AT_HEAD"
+            echo "tag=$TAG_AT_HEAD" >> $GITHUB_OUTPUT
+            echo "is_tag=true" >> $GITHUB_OUTPUT
+          else
+            echo "ℹ️  Deploying commit: $COMMIT_SHORT (not a tag)"
+            echo "tag=" >> $GITHUB_OUTPUT
+            echo "is_tag=false" >> $GITHUB_OUTPUT
           fi
           
-          echo "✅ Deploying tag: $TAG_AT_HEAD"
-          echo "tag=$TAG_AT_HEAD" >> $GITHUB_OUTPUT
-          echo "commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "commit=$COMMIT" >> $GITHUB_OUTPUT
+          echo "commit_short=$COMMIT_SHORT" >> $GITHUB_OUTPUT
 
       - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
@@ -58,7 +65,11 @@ jobs:
 
       - name: Build application
         run: |
-          echo "🔨 Building application from tag ${{ steps.verify-tag.outputs.tag }}..."
+          if [ "${{ steps.verify-source.outputs.is_tag }}" = "true" ]; then
+            echo "🔨 Building application from tag ${{ steps.verify-source.outputs.tag }}..."
+          else
+            echo "🔨 Building application from commit ${{ steps.verify-source.outputs.commit_short }}..."
+          fi
           mvn clean package -DskipTests
 
       - name: Prepare deployment package
@@ -77,8 +88,12 @@ jobs:
       - name: Simulate deployment to SIT
         run: |
           echo "🚀 [PLACEHOLDER] Deploying to SIT environment..."
-          echo "   Tag: ${{ steps.verify-tag.outputs.tag }}"
-          echo "   Commit: ${{ steps.verify-tag.outputs.commit }}"
+          if [ "${{ steps.verify-source.outputs.is_tag }}" = "true" ]; then
+            echo "   Tag: ${{ steps.verify-source.outputs.tag }}"
+          else
+            echo "   Commit: ${{ steps.verify-source.outputs.commit_short }}"
+          fi
+          echo "   Full Commit: ${{ steps.verify-source.outputs.commit }}"
           echo "   Environment: SIT"
           echo "   Package: deploy/app.jar"
           echo "   Profile: sit"

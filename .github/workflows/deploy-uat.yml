@@ -42,11 +42,22 @@ jobs:
       - name: Verify tag at HEAD
         id: verify-tag
         run: |
+          # This validation is redundant but provides additional safety
+          # The uat-branch-guard.yml workflow should have already validated this
+          # This serves as a final check before deployment
+          
           TAG_AT_HEAD=$(git describe --tags --exact-match HEAD 2>/dev/null || echo "")
           
           if [ -z "$TAG_AT_HEAD" ]; then
             echo "❌ ERROR: UAT branch must point to a deployable tag"
+            echo "   This should have been caught by uat-branch-guard.yml workflow"
             echo "   To deploy: git checkout <TAG> && git checkout -B uat && git push origin uat --force"
+            exit 1
+          fi
+          
+          # Validate semantic version format
+          if [[ ! "$TAG_AT_HEAD" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "❌ ERROR: Tag '$TAG_AT_HEAD' does not follow semantic version format (vX.Y.Z)"
             exit 1
           fi
           
@@ -118,8 +129,9 @@ jobs:
     permissions:
       contents: read
     environment:
-      name: ${{ env.ENABLE_PROD_APPROVAL_GATE == 'true' && 'production' || 'production-auto' }}
-
+      name: ${{ vars.ENABLE_PROD_APPROVAL_GATE == 'true' && 'production' || 'production-auto' }}
+      # When ENABLE_PROD_APPROVAL_GATE is 'true', uses 'production' environment (requires approval)
+      # When ENABLE_PROD_APPROVAL_GATE is 'false' or not set, uses 'production-auto' (no approval)
     steps:
       - name: Checkout code (for tag verification)
         uses: actions/checkout@v4
@@ -146,7 +158,12 @@ jobs:
 
       - name: Simulate deployment to Production
         run: |
-          echo "🚀 [PLACEHOLDER] Deploying to Production environment..."
+          if [ "${{ vars.ENABLE_PROD_APPROVAL_GATE }}" = "true" ]; then
+            echo "🚀 [PLACEHOLDER] Deploying to Production environment (with approval gate)..."
+            echo "   ⏸️  Waiting for approval before deployment..."
+          else
+            echo "🚀 [PLACEHOLDER] Deploying to Production environment (auto, no approval)..."
+          fi
           echo "   Tag: ${{ steps.verify-tag.outputs.tag }}"
           echo "   Environment: Production"
           echo "   Package: deploy/app.jar (reused from UAT)"
@@ -168,7 +185,11 @@ jobs:
         if: always()
         run: |
           if [ "${{ job.status }}" = "success" ]; then
-            echo "✅ PRODUCTION deployment completed"
+            if [ "${{ vars.ENABLE_PROD_APPROVAL_GATE }}" = "true" ]; then
+              echo "✅ PRODUCTION deployment completed (with approval)"
+            else
+              echo "✅ PRODUCTION deployment completed (auto)"
+            fi
             echo "   Tag: ${{ steps.verify-tag.outputs.tag }}"
             echo "   Artifact: Reused from UAT deployment"
           else

@@ -1,0 +1,122 @@
+name: '[Guard] Validate UAT Branch Push'
+run-name: |
+  ${{ format('[Guard] Validate UAT Branch Push - Commit {0} by {1}', github.sha, github.actor) }}
+
+# CRITICAL: Pre-push validation for UAT branch
+# - Validates that UAT branch only accepts release tags (vX.Y.Z format)
+# - Blocks feature branches, commits, and non-semantic tags
+# - WHY: UAT must only deploy tested, versioned releases
+# - Configure this as a required status check for 'uat' branch protection
+
+on:
+  push:
+    branches:
+      - uat
+
+jobs:
+  validate-uat-push:
+    name: Validate UAT Branch Push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for tag verification
+
+      - name: Validate HEAD is a release tag
+        id: validate-tag
+        run: |
+          echo "🔍 Validating UAT branch push..."
+          echo "   Commit: ${{ github.sha }}"
+          echo "   Actor: ${{ github.actor }}"
+          echo ""
+          
+          # Check if HEAD is exactly on a tag
+          TAG_AT_HEAD=$(git describe --tags --exact-match HEAD 2>/dev/null || echo "")
+          
+          if [ -z "$TAG_AT_HEAD" ]; then
+            echo "❌ ERROR: UAT branch must point to a release tag"
+            echo "   Current HEAD is NOT a tag - deployment blocked"
+            echo ""
+            echo "   Detected commit: $(git rev-parse --short HEAD)"
+            echo "   Commit message: $(git log -1 --pretty=%B)"
+            echo ""
+            echo "   This appears to be a feature branch or regular commit."
+            echo "   UAT branch only accepts release tags (vX.Y.Z format)."
+            echo ""
+            echo "   ✅ Correct workflow:"
+            echo "      1. Create release tag: git tag -a v1.0.0 -m 'Release v1.0.0'"
+            echo "      2. Or use existing tag: git checkout v1.0.0"
+            echo "      3. Deploy to UAT: git checkout -B uat && git push origin uat --force"
+            echo ""
+            echo "   ❌ Invalid workflows (will be blocked):"
+            echo "      - Pushing feature branch: git push origin feature/xyz:uat"
+            echo "      - Pushing regular commit: git commit && git push origin uat"
+            echo "      - Pushing non-semantic tag: git tag v1.0 && git push origin uat"
+            exit 1
+          fi
+          
+          echo "✅ Tag detected: $TAG_AT_HEAD"
+
+      - name: Validate tag format (semantic versioning)
+        run: |
+          TAG_AT_HEAD=$(git describe --tags --exact-match HEAD 2>/dev/null || echo "")
+          
+          # Validate tag follows semantic versioning: vX.Y.Z
+          if [[ ! "$TAG_AT_HEAD" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "❌ ERROR: Tag '$TAG_AT_HEAD' does not follow semantic version format"
+            echo "   Required format: vX.Y.Z (e.g., v1.0.0, v2.3.1)"
+            echo ""
+            echo "   Invalid tag examples:"
+            echo "     - v1.0 (missing patch version)"
+            echo "     - 1.0.0 (missing 'v' prefix)"
+            echo "     - v1.0.0-beta (pre-release tags not allowed for UAT)"
+            echo "     - release-1.0.0 (non-standard format)"
+            echo ""
+            echo "   ✅ Valid tag examples:"
+            echo "     - v1.0.0"
+            echo "     - v2.3.1"
+            echo "     - v0.1.0"
+            exit 1
+          fi
+          
+          echo "✅ Tag format validated: $TAG_AT_HEAD (semantic version)"
+
+      - name: Verify tag is annotated (not lightweight)
+        run: |
+          TAG_AT_HEAD=$(git describe --tags --exact-match HEAD 2>/dev/null || echo "")
+          
+          # Check if tag is annotated (has message) or lightweight
+          TAG_TYPE=$(git cat-file -t "$TAG_AT_HEAD" 2>/dev/null || echo "")
+          
+          if [ "$TAG_TYPE" != "tag" ]; then
+            echo "⚠️  WARNING: Tag '$TAG_AT_HEAD' is a lightweight tag (not annotated)"
+            echo "   Recommendation: Use annotated tags for releases"
+            echo "   Create annotated tag: git tag -a $TAG_AT_HEAD -m 'Release $TAG_AT_HEAD'"
+            echo "   This is a warning, not an error - deployment will proceed"
+          else
+            TAG_MESSAGE=$(git tag -l --format='%(contents)' "$TAG_AT_HEAD" 2>/dev/null || echo "")
+            echo "✅ Tag is annotated: $TAG_AT_HEAD"
+            if [ -n "$TAG_MESSAGE" ]; then
+              echo "   Tag message: $TAG_MESSAGE"
+            fi
+          fi
+
+      - name: Display validation summary
+        run: |
+          TAG_AT_HEAD=$(git describe --tags --exact-match HEAD 2>/dev/null || echo "")
+          COMMIT=$(git rev-parse HEAD)
+          COMMIT_SHORT=$(git rev-parse --short HEAD)
+          
+          echo ""
+          echo "✅ UAT Branch Push Validation Passed"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "   Tag:        $TAG_AT_HEAD"
+          echo "   Commit:     $COMMIT_SHORT"
+          echo "   Full SHA:   $COMMIT"
+          echo "   Actor:      ${{ github.actor }}"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "✅ UAT deployment will proceed with tag: $TAG_AT_HEAD"
