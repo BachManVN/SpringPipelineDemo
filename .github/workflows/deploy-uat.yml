@@ -2,18 +2,18 @@ name: '[CD] Deploy to UAT and Production'
 run-name: |
   ${{ format('[CD] Deploy to UAT and Production - Commit {0} by {1}', github.sha, github.actor) }}
 
-# DEPLOYMENT MODEL: Unified UAT → Production pipeline
+# DEPLOYMENT MODEL: UAT → Production pipeline
+# - Environments: SIT (separate workflow), UAT, Production
 # - Triggered when 'uat' branch is updated (force-pushed to point to a tag)
 # - Step 1: Deploy to UAT environment
-# - Step 2: Pause for approval (if ENABLE_PROD_APPROVAL_GATE is enabled)
-# - Step 3: Deploy same artifact to Production (reuses UAT build)
+# - Step 2: Deploy same artifact to Production (requires approval via GitHub environment protection rules)
 # - WHY: Ensures production uses exact same artifact tested in UAT
 #
 # CONFIGURATION:
-# - Set GitHub variable: ENABLE_PROD_APPROVAL_GATE = "true" to enable approval gate
-# - When enabled: Requires approval in GitHub environment "production"
-# - When disabled: Automatically continues to production (GitHub Free compatible)
+# - Configure GitHub environments (lowercase): "sit", "uat", "production"
+# - Configure GitHub environment "production" with Required reviewers for approval gate
 # - Artifact reuse: Production deployment reuses the JAR built for UAT
+# - Note: SIT deployments are handled by deploy-sit.yml workflow
 
 on:
   push:
@@ -26,8 +26,6 @@ env:
   AZURE_RESOURCE_GROUP_UAT: ${{ vars.AZURE_RESOURCE_GROUP_UAT || 'rg-springboot-demo-uat' }}
   AZURE_WEBAPP_NAME_PROD: ${{ vars.AZURE_WEBAPP_NAME_PROD || 'springboot-azure-demo-prod' }}
   AZURE_RESOURCE_GROUP_PROD: ${{ vars.AZURE_RESOURCE_GROUP_PROD || 'rg-springboot-demo-prod' }}
-  AZURE_REGION: ${{ vars.AZURE_REGION || 'southeastasia' }}
-  ENABLE_PROD_APPROVAL_GATE: ${{ vars.ENABLE_PROD_APPROVAL_GATE || 'false' }}
 
 jobs:
   deploy-uat:
@@ -120,7 +118,7 @@ jobs:
         with:
           app-name: ${{ env.AZURE_WEBAPP_NAME_UAT }}
           package: deploy/app.jar
-          slot-name: ''  # Deploy directly to production slot (no deployment slots for UAT)
+          slot-name: ''  # Deploy directly to UAT slot
           startup-command: 'java -jar /home/site/wwwroot/app.jar --spring.profiles.active=uat'
 
       - name: Verify UAT deployment health
@@ -152,7 +150,7 @@ jobs:
       contents: read
       id-token: write
     environment:
-      name: ${{ env.ENABLE_PROD_APPROVAL_GATE == 'true' && 'production' || 'production-auto' }}
+      name: production
       url: https://${{ env.AZURE_WEBAPP_NAME_PROD }}.azurewebsites.net
 
     steps:
@@ -170,7 +168,7 @@ jobs:
             echo "❌ ERROR: UAT branch must point to a deployable tag"
             exit 1
           fi
-          echo "✅ Deploying to production: $TAG_AT_HEAD"
+          echo "✅ Deploying to Production: $TAG_AT_HEAD"
           echo "tag=$TAG_AT_HEAD" >> $GITHUB_OUTPUT
 
       - name: Download deployment artifact
@@ -184,82 +182,25 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS_PROD }}
 
-      - name: Determine deployment strategy
-        id: deployment-strategy
+      - name: Check for staging slot
+        id: check-slot
         run: |
           APP_NAME="${{ env.AZURE_WEBAPP_NAME_PROD }}"
           RESOURCE_GROUP="${{ env.AZURE_RESOURCE_GROUP_PROD }}"
           
-          # Check if App Service Plan supports slots (Free/Shared tiers don't)
-          PLAN_ID=$(az webapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" --query "appServicePlanId" -o tsv 2>/dev/null || echo "")
-          if [ -n "$PLAN_ID" ]; then
-            PLAN_SKU=$(az appservice plan show --ids "$PLAN_ID" --query "sku.name" -o tsv 2>/dev/null || echo "")
-            if [ "$PLAN_SKU" = "F1" ] || [ "$PLAN_SKU" = "D1" ] || [ "$PLAN_SKU" = "FREE" ] || [ "$PLAN_SKU" = "SHARED" ]; then
-              echo "ℹ️  Free/Shared tier - direct deployment"
-              echo "slots_enabled=false" >> $GITHUB_OUTPUT
-              echo "slot_name=" >> $GITHUB_OUTPUT
-              echo "auto_swap=false" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-          fi
-          
-          # Check for multi-version mode
-          MULTI_VERSION_MODE="${{ vars.AZURE_MULTI_VERSION_MODE }}"
-          if [ "$MULTI_VERSION_MODE" = "true" ] || [ "$MULTI_VERSION_MODE" = "1" ]; then
-            DEPLOYMENT_TAG="${{ steps.verify-tag.outputs.tag }}"
-            SLOT_NAME="slot-$(echo "${DEPLOYMENT_TAG#v}" | tr '.' '-')"
-            echo "✅ Multi-version mode - slot: $SLOT_NAME"
-            echo "slots_enabled=true" >> $GITHUB_OUTPUT
-            echo "slot_name=$SLOT_NAME" >> $GITHUB_OUTPUT
-            echo "auto_swap=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-          
-          # Single version mode - check if staging slot exists
           STAGING_SLOT=$(az webapp deployment slot list \
             --resource-group "$RESOURCE_GROUP" \
             --name "$APP_NAME" \
             --query "[?name=='staging'].name" -o tsv 2>/dev/null || echo "")
           
           if [ -n "$STAGING_SLOT" ]; then
-            echo "✅ Staging slot detected - blue-green deployment"
-            echo "slots_enabled=true" >> $GITHUB_OUTPUT
+            echo "✅ Staging slot detected - using blue-green deployment for Production"
+            echo "use_slot=true" >> $GITHUB_OUTPUT
             echo "slot_name=staging" >> $GITHUB_OUTPUT
-            echo "auto_swap=true" >> $GITHUB_OUTPUT
           else
-            echo "ℹ️  Direct deployment to production slot"
-            echo "slots_enabled=false" >> $GITHUB_OUTPUT
+            echo "ℹ️  No staging slot - direct deployment to Production"
+            echo "use_slot=false" >> $GITHUB_OUTPUT
             echo "slot_name=" >> $GITHUB_OUTPUT
-            echo "auto_swap=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Ensure deployment slot exists (multi-version mode)
-        if: |
-          steps.deployment-strategy.outputs.slots_enabled == 'true' &&
-          steps.deployment-strategy.outputs.auto_swap != 'true'
-        run: |
-          set -e
-          APP_NAME="${{ env.AZURE_WEBAPP_NAME_PROD }}"
-          RESOURCE_GROUP="${{ env.AZURE_RESOURCE_GROUP_PROD }}"
-          SLOT_NAME="${{ steps.deployment-strategy.outputs.slot_name }}"
-          
-          SLOT_EXISTS=$(az webapp deployment slot list \
-            --resource-group "$RESOURCE_GROUP" \
-            --name "$APP_NAME" \
-            --query "[?name=='$SLOT_NAME'].name" -o tsv 2>/dev/null || echo "")
-          
-          if [ -z "$SLOT_EXISTS" ]; then
-            echo "📦 Creating slot: $SLOT_NAME"
-            if ! az webapp deployment slot create \
-              --resource-group "$RESOURCE_GROUP" \
-              --name "$APP_NAME" \
-              --slot "$SLOT_NAME" \
-              --configuration-source "$APP_NAME" \
-              --output none 2>&1; then
-              echo "❌ ERROR: Failed to create slot"
-              exit 1
-            fi
-            echo "✅ Slot created"
           fi
 
       - name: Get App Service hostname (Production)
@@ -267,7 +208,6 @@ jobs:
         run: |
           APP_NAME="${{ env.AZURE_WEBAPP_NAME_PROD }}"
           RESOURCE_GROUP="${{ env.AZURE_RESOURCE_GROUP_PROD }}"
-          SLOT_NAME="${{ steps.deployment-strategy.outputs.slot_name }}"
           
           if ! az webapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" >/dev/null 2>&1; then
             echo "❌ ERROR: App Service not found"
@@ -275,31 +215,19 @@ jobs:
           fi
           
           PROD_HOSTNAME=$(az webapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" --query "defaultHostName" -o tsv 2>/dev/null || echo "$APP_NAME.azurewebsites.net")
-          
-          if [ "${{ steps.deployment-strategy.outputs.slots_enabled }}" = "true" ] && [ -n "$SLOT_NAME" ]; then
-            HOSTNAME=$(az webapp deployment slot show \
-              --name "$APP_NAME" \
-              --resource-group "$RESOURCE_GROUP" \
-              --slot "$SLOT_NAME" \
-              --query "defaultHostName" -o tsv 2>/dev/null || echo "$PROD_HOSTNAME")
-          else
-            HOSTNAME="$PROD_HOSTNAME"
-          fi
-          
-          echo "hostname=$HOSTNAME" >> $GITHUB_OUTPUT
-          echo "prod_hostname=$PROD_HOSTNAME" >> $GITHUB_OUTPUT
+          echo "hostname=$PROD_HOSTNAME" >> $GITHUB_OUTPUT
 
-      - name: Deploy to Azure deployment slot
-        if: steps.deployment-strategy.outputs.slots_enabled == 'true'
+      - name: Deploy to Production staging slot
+        if: steps.check-slot.outputs.use_slot == 'true'
         uses: azure/webapps-deploy@v3
         with:
           app-name: ${{ env.AZURE_WEBAPP_NAME_PROD }}
           package: deploy/app.jar
-          slot-name: ${{ steps.deployment-strategy.outputs.slot_name }}
+          slot-name: ${{ steps.check-slot.outputs.slot_name }}
           startup-command: 'java -jar /home/site/wwwroot/app.jar --spring.profiles.active=prod'
 
-      - name: Deploy to Azure production slot (direct deployment)
-        if: steps.deployment-strategy.outputs.slots_enabled != 'true'
+      - name: Deploy to Production (direct)
+        if: steps.check-slot.outputs.use_slot != 'true'
         uses: azure/webapps-deploy@v3
         with:
           app-name: ${{ env.AZURE_WEBAPP_NAME_PROD }}
@@ -307,72 +235,70 @@ jobs:
           slot-name: ''
           startup-command: 'java -jar /home/site/wwwroot/app.jar --spring.profiles.active=prod'
 
-      - name: Verify deployment health
-        if: steps.deployment-strategy.outputs.slots_enabled == 'true'
+      - name: Verify staging slot deployment health
+        if: steps.check-slot.outputs.use_slot == 'true'
         run: |
-          HEALTH_URL="https://${{ steps.app-service-prod.outputs.hostname }}/actuator/health"
+          APP_NAME="${{ env.AZURE_WEBAPP_NAME_PROD }}"
+          RESOURCE_GROUP="${{ env.AZURE_RESOURCE_GROUP_PROD }}"
+          SLOT_NAME="${{ steps.check-slot.outputs.slot_name }}"
+          
+          HOSTNAME=$(az webapp deployment slot show \
+            --name "$APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --slot "$SLOT_NAME" \
+            --query "defaultHostName" -o tsv 2>/dev/null || echo "")
+          
+          HEALTH_URL="https://${HOSTNAME}/actuator/health"
           sleep 15
-          for i in $(seq 1 15); do
-            http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$HEALTH_URL" 2>/dev/null || echo "000")
-            [ "$http_code" = "200" ] && echo "✅ Deployment verified" && exit 0
-            [ $i -lt 15 ] && sleep 8
-          done
-          echo "❌ Health check failed"
-          exit 1
-
-      - name: Swap slot to production
-        if: steps.deployment-strategy.outputs.auto_swap == 'true'
-        uses: azure/CLI@v2
-        with:
-          inlineScript: |
-            az webapp deployment slot swap \
-              --resource-group ${{ env.AZURE_RESOURCE_GROUP_PROD }} \
-              --name ${{ env.AZURE_WEBAPP_NAME_PROD }} \
-              --slot ${{ steps.deployment-strategy.outputs.slot_name }} \
-              --target-slot production
-
-      - name: Verify production deployment
-        id: verify-prod
-        run: |
-          HEALTH_URL="https://${{ steps.app-service-prod.outputs.prod_hostname }}/actuator/health"
-          sleep 15
+          
           for i in $(seq 1 15); do
             http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$HEALTH_URL" 2>/dev/null || echo "000")
             if [ "$http_code" = "200" ]; then
-              echo "✅ Production deployment verified - Tag: ${{ steps.verify-tag.outputs.tag }}"
-              echo "verification_passed=true" >> $GITHUB_ENV
+              echo "✅ Production staging slot deployment verified"
               exit 0
             fi
             [ $i -lt 15 ] && sleep 8
           done
-          echo "❌ Production health check failed"
-          echo "verification_passed=false" >> $GITHUB_ENV
+          
+          echo "❌ Production staging slot health check failed"
           exit 1
 
-      - name: Rollback production deployment
-        if: |
-          steps.deployment-strategy.outputs.auto_swap == 'true' &&
-          (steps.verify-prod.outcome == 'failure' || env.verification_passed == 'false')
+      - name: Swap staging slot to Production
+        if: steps.check-slot.outputs.use_slot == 'true'
         uses: azure/CLI@v2
         with:
           inlineScript: |
             az webapp deployment slot swap \
               --resource-group ${{ env.AZURE_RESOURCE_GROUP_PROD }} \
               --name ${{ env.AZURE_WEBAPP_NAME_PROD }} \
-              --slot ${{ steps.deployment-strategy.outputs.slot_name }} \
+              --slot staging \
               --target-slot production
+
+      - name: Verify Production deployment
+        run: |
+          HEALTH_URL="https://${{ steps.app-service-prod.outputs.hostname }}/actuator/health"
+          sleep 15
+          
+          for i in $(seq 1 15); do
+            http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$HEALTH_URL" 2>/dev/null || echo "000")
+            if [ "$http_code" = "200" ]; then
+              echo "✅ Production deployment verified - Tag: ${{ steps.verify-tag.outputs.tag }}"
+              echo "   Artifact: Reused from UAT deployment"
+              exit 0
+            fi
+            [ $i -lt 15 ] && sleep 8
+          done
+          
+          echo "❌ Production health check failed"
+          exit 1
 
       - name: Post deployment notification
         if: always()
         run: |
-          if [ "${{ job.status }}" = "success" ] && [ "${{ env.verification_passed }}" = "true" ]; then
+          if [ "${{ job.status }}" = "success" ]; then
             echo "✅ PRODUCTION deployment completed"
             echo "   Tag: ${{ steps.verify-tag.outputs.tag }}"
             echo "   Artifact: Reused from UAT deployment"
-            if [ "${{ steps.deployment-strategy.outputs.auto_swap }}" != "true" ] && [ -n "${{ steps.deployment-strategy.outputs.slot_name }}" ]; then
-              echo "   Slot: ${{ steps.deployment-strategy.outputs.slot_name }} (ready for manual swap)"
-            fi
           else
             echo "❌ PRODUCTION deployment failed"
-            [ "${{ steps.deployment-strategy.outputs.auto_swap }}" = "true" ] && echo "   Rollback performed"
           fi
