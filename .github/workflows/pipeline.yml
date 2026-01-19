@@ -11,8 +11,17 @@ run-name: |
 # NOTE: This workflow is a MANUAL DEPLOYMENT HELPER (documentation only)
 # WHY: It provides instructions for manual deployments but does NOT deploy
 # WHY: Actual deployments are handled by: deploy-sit.yml, deploy-uat.yml, deploy-prod.yml
+# WHY: This workflow is kept for documentation/helper purposes, not for actual deployment
+#
+# This workflow does NOT duplicate any deployment functionality
+# Individual workflows handle their own deployment logic
 
 on:
+  # Workflows are triggered by branch pushes:
+  # - sit branch push → deploy-sit.yml
+  # - uat branch push → deploy-uat.yml
+  # - prod branch push → deploy-prod.yml (after PR: uat → prod)
+  # - hotfix branch push → hotfix-tag.yml (creates tag)
   workflow_dispatch:
     inputs:
       env:

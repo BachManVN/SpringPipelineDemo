@@ -4,7 +4,15 @@ run-name: |
 
 # CRITICAL: This is the ONLY authoritative tag creation path for normal releases
 # WHY: Tags decide WHAT is deployed - only CI should create deployable tags
+# WHY: Having multiple tag creation mechanisms causes confusion and conflicts
+#
+# TAG CREATION RULES:
+# - Normal releases: release-tag.yml (triggered on main branch push)
+# - Hotfix releases: hotfix-tag.yml (triggered on hotfix branch push after PR merge)
+# - CI must be the ONLY tag creator (no human-created deployable tags)
+#
 # This creates release tags automatically when code is merged to main branch
+# Deployment to UAT requires manual action (force-push uat branch to tag)
 
 on:
   push:
@@ -19,7 +27,8 @@ jobs:
     name: Create Release Tag
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # Required to create tags
+      contents: write  # Required to create tags and update branches
+      id-token: write  # Required for Azure authentication if needed
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -29,60 +38,152 @@ jobs:
 
       - name: Verify main branch
         run: |
+          echo "🔍 Verifying main branch requirements..."
+          
+          # Check the ref that triggered this workflow
           if [ "${{ github.ref_name }}" != "main" ]; then
             echo "❌ ERROR: This workflow should only run on 'main' branch"
+            echo "   Current ref: ${{ github.ref_name }}"
             exit 1
           fi
+          
           echo "✅ Workflow triggered by main branch push"
-
-      - name: Configure Git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "   Commit: ${{ github.sha }}"
+          echo "   Ref: ${{ github.ref }}"
 
       - name: Determine next release version
         id: version
         run: |
           echo "🔍 Determining next release version..."
+          echo "   Workflow triggered by: ${{ github.event_name }}"
+          echo "   Ref: ${{ github.ref }}"
+          echo "   SHA: ${{ github.sha }}"
+          
+          # Fetch all tags from remote
+          echo "📥 Fetching all tags from remote..."
           git fetch --tags --force
           
+          # Get latest semantic version tag
           LATEST_TAG=$(git tag -l "v[0-9]*.[0-9]*.[0-9]*" | sort -V | tail -1 || echo "v0.0.0")
           echo "📌 Latest version: $LATEST_TAG"
           
+          # Debug: show all tags
+          echo "📋 All existing tags:"
+          git tag -l "v*" | sort -V | tail -10 || echo "   (No tags found)"
+          
+          # Extract version components
           if [[ "$LATEST_TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
             MAJOR="${BASH_REMATCH[1]}"
             MINOR="${BASH_REMATCH[2]}"
             PATCH="${BASH_REMATCH[3]}"
           else
+            echo "⚠️  Invalid latest tag format, starting from v0.1.0"
             MAJOR=0
             MINOR=1
             PATCH=0
           fi
           
-          # Default to minor version bump
-          NEW_MINOR=$((MINOR + 1))
-          NEW_VERSION="v${MAJOR}.${NEW_MINOR}.0"
+          # Determine version bump based on commit message
+          LAST_COMMIT_MSG=$(git log -1 --pretty=%B)
           
-          echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_OUTPUT
-          echo "✅ Next version: $NEW_VERSION"
-
-      - name: Create and push tag
-        run: |
-          NEW_VERSION="${{ steps.version.outputs.NEW_VERSION }}"
+          if echo "$LAST_COMMIT_MSG" | grep -qiE "^(feat|feature):"; then
+            # Feature: increment minor version (v1.4.0 → v1.5.0)
+            MINOR=$((MINOR + 1))
+            PATCH=0
+            BUMP_TYPE="minor"
+          elif echo "$LAST_COMMIT_MSG" | grep -qiE "^(fix|bugfix):"; then
+            # Bugfix: increment patch version (v1.4.0 → v1.4.1)
+            PATCH=$((PATCH + 1))
+            BUMP_TYPE="patch"
+          elif echo "$LAST_COMMIT_MSG" | grep -qiE "^(BREAKING|breaking|major):"; then
+            # Breaking change: increment major version (v1.4.0 → v2.0.0)
+            MAJOR=$((MAJOR + 1))
+            MINOR=0
+            PATCH=0
+            BUMP_TYPE="major"
+          else
+            # Default: increment minor version (v1.4.0 → v1.5.0)
+            MINOR=$((MINOR + 1))
+            PATCH=0
+            BUMP_TYPE="minor"
+          fi
+          
+          NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
           
           # Check if tag already exists
           if git rev-parse "$NEW_VERSION" >/dev/null 2>&1; then
+            echo "⚠️  Tag $NEW_VERSION already exists, checking for conflicts..."
             EXISTING_COMMIT=$(git rev-parse "$NEW_VERSION")
             CURRENT_COMMIT=$(git rev-parse HEAD)
             if [ "$EXISTING_COMMIT" != "$CURRENT_COMMIT" ]; then
               echo "❌ ERROR: Tag $NEW_VERSION already exists and points to different commit"
+              echo "   Existing: $EXISTING_COMMIT"
+              echo "   Current:  $CURRENT_COMMIT"
               exit 1
+            else
+              echo "✅ Tag $NEW_VERSION already exists and points to current commit"
+              echo "release_tag=$NEW_VERSION" >> $GITHUB_OUTPUT
+              echo "tag_exists=true" >> $GITHUB_OUTPUT
+              echo "bump_type=$BUMP_TYPE" >> $GITHUB_OUTPUT
+              exit 0
             fi
-            echo "✅ Tag $NEW_VERSION already exists at current commit"
-            exit 0
           fi
           
-          echo "📦 Creating annotated tag: $NEW_VERSION"
-          git tag -a "$NEW_VERSION" -m "Release $NEW_VERSION"
-          git push origin "$NEW_VERSION"
-          echo "✅ Tag $NEW_VERSION created and pushed"
+          echo "✅ Release tag: $NEW_VERSION ($BUMP_TYPE bump from $LATEST_TAG)"
+          echo "release_tag=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "tag_exists=false" >> $GITHUB_OUTPUT
+          echo "bump_type=$BUMP_TYPE" >> $GITHUB_OUTPUT
+
+      - name: Create release tag
+        if: steps.version.outputs.tag_exists != 'true'
+        run: |
+          RELEASE_TAG="${{ steps.version.outputs.release_tag }}"
+          COMMIT_SHA="${{ github.sha }}"
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          BUMP_TYPE="${{ steps.version.outputs.bump_type }}"
+          
+          echo "🏷️  Creating release tag: $RELEASE_TAG"
+          echo "   Commit: $COMMIT_SHA"
+          echo "   Bump type: $BUMP_TYPE"
+          echo "   Message: $COMMIT_MSG"
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Create annotated tag
+          git tag -a "$RELEASE_TAG" -m "Release $RELEASE_TAG
+          
+          Commit: $COMMIT_SHA
+          Message: $COMMIT_MSG
+          Bump type: $BUMP_TYPE
+          
+          This release tag was automatically created after merge to main branch."
+          
+          # Push tag to remote
+          git push origin "$RELEASE_TAG"
+          
+          echo "✅ Release tag created and pushed: $RELEASE_TAG"
+
+
+      - name: Tag creation summary
+        if: always()
+        run: |
+          if [ "${{ steps.version.outputs.tag_exists }}" = "true" ]; then
+            echo "ℹ️  Tag ${{ steps.version.outputs.release_tag }} already exists"
+          else
+            echo "✅ Successfully created release tag: ${{ steps.version.outputs.release_tag }}"
+            echo "   Bump type: ${{ steps.version.outputs.bump_type }}"
+            echo ""
+            echo "   Next steps (manual deployment required):"
+            echo "   1. Deploy to SIT (optional):"
+            echo "      git checkout ${{ steps.version.outputs.release_tag }}"
+            echo "      git checkout -B sit"
+            echo "      git push origin sit --force"
+            echo ""
+            echo "   2. Deploy to UAT:"
+            echo "      git checkout ${{ steps.version.outputs.release_tag }}"
+            echo "      git checkout -B uat"
+            echo "      git push origin uat --force"
+            echo ""
+            echo "   3. After UAT testing, create PR: uat → prod"
+          fi
