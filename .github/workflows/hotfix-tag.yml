@@ -4,6 +4,7 @@ run-name: |
 
 # CRITICAL: This is the ONLY place hotfix tags are created
 # WHY: CI must be the only tag creator to ensure consistency and prevent conflicts
+# Humans must NOT create hotfix tags directly
 #
 # HOTFIX WORKFLOW:
 # 1. Checkout an older release tag (e.g., v1.4.0 when latest is v1.6.0)
@@ -11,6 +12,10 @@ run-name: |
 # 3. Make fixes, test on SIT, then create PR: fix-bug-1.4.0 → hotfix
 # 4. When PR is merged to hotfix branch, this workflow triggers
 # 5. Workflow detects base tag (v1.4.0) and creates hotfix tag (v1.4.1)
+# 6. Deploy hotfix tag to UAT: git checkout v1.4.1 && ./bin/deploy.sh uat
+# 7. After UAT testing, create PR: uat → prod
+#
+# Branch role: hotfix is a PR-gated tag creation branch (pointer branch, not code source)
 
 on:
   push:
@@ -26,6 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write  # Required to create tags
+      id-token: write  # Required for Azure authentication if needed
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -33,82 +39,181 @@ jobs:
           fetch-depth: 0  # Fetch all history for tag detection
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Configure Git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
 
       - name: Fetch all tags
         run: |
           echo "📥 Fetching all tags from remote..."
           git fetch --tags --force
+          echo "✅ Tags fetched"
 
       - name: Verify hotfix branch requirements
         run: |
+          echo "🔍 Verifying hotfix branch requirements..."
+          echo "   WHY: hotfix branch is PR-gated - tags are only created after PR merge"
+          
+          # Ensure we're on hotfix branch
           CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
           if [ "$CURRENT_BRANCH" != "hotfix" ]; then
             echo "❌ ERROR: This workflow should only run on 'hotfix' branch"
             exit 1
           fi
-          echo "✅ Verified hotfix branch"
-
-      - name: Find base tag for hotfix
-        id: find-base-tag
-        run: |
-          BASE_TAG=""
-          for i in $(seq 0 10); do
-            TAG=$(git describe --tags --abbrev=0 HEAD~$i 2>/dev/null || echo "")
-            if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              BASE_TAG="$TAG"
-              break
-            fi
-          done
           
+          # CRITICAL: Find the base tag for hotfix version calculation
+          # WHY: Hotfix tags increment patch version from base tag (v1.4.0 → v1.4.1)
+          # Strategy: Find the nearest semantic version tag that is an ancestor of current commit
+          # This works even after PR merge because git describe finds the tag in history
+          BASE_TAG=$(git describe --tags --abbrev=0 HEAD 2>/dev/null || echo "")
+          
+          # If no tag found, try parent commits (in case of merge commits)
+          if [ -z "$BASE_TAG" ]; then
+            for i in {1..10}; do
+              BASE_TAG=$(git describe --tags --abbrev=0 HEAD~$i 2>/dev/null || echo "")
+              if [ -n "$BASE_TAG" ]; then
+                break
+              fi
+            done
+          fi
+          
+          # Validate base tag exists and has correct format
           if [ -z "$BASE_TAG" ]; then
             echo "❌ ERROR: Cannot determine base tag for hotfix"
+            echo "   WHY: Hotfix tags must be based on an existing semantic version tag"
+            echo "   Workflow: Checkout old tag (e.g., v1.4.0) → create fix-bug-1.4.0 → PR to hotfix"
+            echo ""
+            echo "   Available tags:"
+            git tag -l "v[0-9]*.[0-9]*.[0-9]*" | sort -V | tail -10 || echo "   (No tags found)"
             exit 1
+          fi
+          
+          # Validate tag format
+          if [[ ! "$BASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "❌ ERROR: Base tag must be semantic version format: $BASE_TAG"
+            echo "   WHY: Only semantic version tags (vX.Y.Z) can be used as hotfix base"
+            echo "   Expected format: v1.4.0, v2.0.0, etc."
+            exit 1
+          fi
+          
+          echo "✅ Base tag found: $BASE_TAG"
+          echo "   WHY: Hotfix will increment patch version from this base tag"
+          
+          # Calculate next version for display
+          if [[ "$BASE_TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            MAJOR="${BASH_REMATCH[1]}"
+            MINOR="${BASH_REMATCH[2]}"
+            PATCH="${BASH_REMATCH[3]}"
+            NEXT_PATCH=$((PATCH + 1))
+            echo "   Example: $BASE_TAG → v${MAJOR}.${MINOR}.${NEXT_PATCH}"
           fi
           
           echo "BASE_TAG=$BASE_TAG" >> $GITHUB_ENV
-          echo "✅ Base tag: $BASE_TAG"
 
-      - name: Calculate hotfix version
-        id: calculate-version
+      - name: Determine next hotfix version
+        id: version
         run: |
+          echo "🔍 Determining next hotfix version..."
+          echo "   WHY: Auto-calculate next patch version to prevent conflicts"
+          
           BASE_TAG="${{ env.BASE_TAG }}"
           
-          if [[ ! "$BASE_TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+          # CRITICAL: Extract version components from base tag (e.g., v1.4.0)
+          # WHY: Hotfix increments patch version automatically (v1.4.0 → v1.4.1)
+          if [[ "$BASE_TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            MAJOR="${BASH_REMATCH[1]}"
+            MINOR="${BASH_REMATCH[2]}"
+            PATCH="${BASH_REMATCH[3]}"
+            
+            # CRITICAL: Hotfix increments patch version: v1.4.0 → v1.4.1
+            # WHY: Patch version bump indicates hotfix (backward-compatible bug fix)
+            NEW_PATCH=$((PATCH + 1))
+            HOTFIX_TAG="v${MAJOR}.${MINOR}.${NEW_PATCH}"
+          else
             echo "❌ ERROR: Invalid base tag format: $BASE_TAG"
+            echo "   Expected format: vX.Y.Z (e.g., v1.4.0)"
             exit 1
           fi
           
-          MAJOR="${BASH_REMATCH[1]}"
-          MINOR="${BASH_REMATCH[2]}"
-          PATCH="${BASH_REMATCH[3]}"
-          
-          NEW_PATCH=$((PATCH + 1))
-          HOTFIX_TAG="v${MAJOR}.${MINOR}.${NEW_PATCH}"
-          
-          echo "HOTFIX_TAG=$HOTFIX_TAG" >> $GITHUB_ENV
-          echo "✅ Hotfix version: $HOTFIX_TAG (from $BASE_TAG)"
-
-      - name: Create and push hotfix tag
-        run: |
-          HOTFIX_TAG="${{ env.HOTFIX_TAG }}"
-          
-          # Check if tag already exists
+          # CRITICAL: Check if tag already exists to prevent duplicate tags
+          # WHY: Duplicate tags cause deployment confusion and conflicts
           if git rev-parse "$HOTFIX_TAG" >/dev/null 2>&1; then
+            echo "⚠️  Tag $HOTFIX_TAG already exists, checking for conflicts..."
+            # If tag exists and points to different commit, error
             EXISTING_COMMIT=$(git rev-parse "$HOTFIX_TAG")
             CURRENT_COMMIT=$(git rev-parse HEAD)
             if [ "$EXISTING_COMMIT" != "$CURRENT_COMMIT" ]; then
               echo "❌ ERROR: Tag $HOTFIX_TAG already exists and points to different commit"
+              echo "   WHY: Duplicate tags pointing to different commits cause deployment conflicts"
+              echo "   Existing: $EXISTING_COMMIT"
+              echo "   Current:  $CURRENT_COMMIT"
               exit 1
+            else
+              echo "✅ Tag $HOTFIX_TAG already exists and points to current commit"
+              echo "   WHY: Tag already created, skipping duplicate creation"
+              echo "hotfix_tag=$HOTFIX_TAG" >> $GITHUB_OUTPUT
+              echo "tag_exists=true" >> $GITHUB_OUTPUT
+              exit 0
             fi
-            echo "✅ Tag $HOTFIX_TAG already exists at current commit"
-            exit 0
           fi
           
-          echo "📦 Creating annotated hotfix tag: $HOTFIX_TAG"
-          git tag -a "$HOTFIX_TAG" -m "Hotfix $HOTFIX_TAG"
+          echo "✅ Hotfix tag: $HOTFIX_TAG (from base $BASE_TAG)"
+          echo "   WHY: Auto-calculated patch version increment for hotfix"
+          echo "hotfix_tag=$HOTFIX_TAG" >> $GITHUB_OUTPUT
+          echo "tag_exists=false" >> $GITHUB_OUTPUT
+
+      - name: Create hotfix tag
+        if: steps.version.outputs.tag_exists != 'true'
+        run: |
+          HOTFIX_TAG="${{ steps.version.outputs.hotfix_tag }}"
+          COMMIT_SHA="${{ github.sha }}"
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          
+          echo "🏷️  Creating hotfix tag: $HOTFIX_TAG"
+          echo "   WHY: Use annotated tags for rich metadata (author, date, message)"
+          echo "   Commit: $COMMIT_SHA"
+          echo "   Message: $COMMIT_MSG"
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # CRITICAL: Create annotated tag (not lightweight)
+          # WHY: Annotated tags store metadata (author, date, message) and are better for releases
+          # WHY: Annotated tags are required for git describe --exact-match to work reliably
+          git tag -a "$HOTFIX_TAG" -m "Hotfix $HOTFIX_TAG
+          
+          Commit: $COMMIT_SHA
+          Message: $COMMIT_MSG
+          
+          Base tag: ${{ env.BASE_TAG }}
+          
+          Base tag: ${{ env.BASE_TAG }}
+          
+          This hotfix tag was automatically created after PR merge to hotfix branch.
+          Workflow: fix-bug-<version> branch → PR to hotfix → auto-tag creation
+          WHY: CI must be the only tag creator to ensure consistency."
+          
+          # Push tag to remote
           git push origin "$HOTFIX_TAG"
-          echo "✅ Hotfix tag $HOTFIX_TAG created and pushed"
+          
+          echo "✅ Hotfix tag created and pushed: $HOTFIX_TAG"
+          echo "   WHY: Tag is now available for deployment to UAT"
+
+      - name: Tag creation summary
+        if: always()
+        run: |
+          if [ "${{ steps.version.outputs.tag_exists }}" = "true" ]; then
+            echo "ℹ️  Tag ${{ steps.version.outputs.hotfix_tag }} already exists"
+          else
+            echo "✅ Successfully created hotfix tag: ${{ steps.version.outputs.hotfix_tag }}"
+            echo "   Base tag: ${{ env.BASE_TAG }}"
+            echo ""
+            echo "   Next steps:"
+            echo "   1. Deploy to UAT:"
+            echo "      git checkout ${{ steps.version.outputs.hotfix_tag }}"
+            echo "      ./bin/deploy.sh uat"
+            echo ""
+            echo "   2. After UAT testing, create PR: uat → prod"
+          fi

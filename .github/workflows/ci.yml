@@ -12,6 +12,9 @@ on:
   # CRITICAL: CI does NOT run on sit/uat branches
   # WHY: sit/uat are deployment pointer branches, not code sources
   # WHY: CI should only validate code before merge, not on deployment branches
+  # Note: Removed push trigger to avoid duplicate CI runs
+  # CI will only run on PRs, which is the standard practice
+  # This saves CI minutes and avoids confusion
 
 env:
   JAVA_VERSION: '17'
@@ -21,6 +24,7 @@ permissions:
   contents: read
   # CRITICAL: CI has read-only permissions
   # WHY: CI should NEVER deploy or create tags - only validate code quality
+  # WHY: Deployment and tagging are handled by separate workflows with write permissions
 
 jobs:
   build-and-test:
@@ -97,6 +101,7 @@ jobs:
           name: coverage-xml
           path: target/site/jacoco/jacoco.xml
           retention-days: 30
+
 
       - name: Build JAR
         run: |

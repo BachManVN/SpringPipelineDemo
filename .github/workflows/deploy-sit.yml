@@ -5,7 +5,7 @@ run-name: |
 # DEPLOYMENT MODEL: Tag-based deployment
 # - Triggered when 'sit' branch is updated (force-pushed to point to a tag)
 # - Verifies 'sit' branch points to a deployable tag
-# - Simulates deployment to SIT environment (placeholder for actual deployment)
+# - Deploys the tagged version to SIT environment
 # - SIT branch is a deployment pointer, not a code source
 
 on:
@@ -15,6 +15,9 @@ on:
 
 env:
   JAVA_VERSION: '17'
+  AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME_SIT || 'springboot-azure-demo-sit' }}
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP_SIT || 'rg-springboot-demo-sit' }}
+  AZURE_REGION: ${{ vars.AZURE_REGION || 'southeastasia' }}
 
 jobs:
   deploy-sit:
@@ -22,8 +25,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write  # Required for Azure authentication
     environment:
       name: sit
+      url: https://${{ env.AZURE_WEBAPP_NAME }}.azurewebsites.net
 
     steps:
       - name: Checkout code
@@ -31,27 +36,20 @@ jobs:
         with:
           fetch-depth: 0  # Fetch all history for tag verification
 
-      - name: Verify deployment source
-        id: verify-source
+      - name: Verify tag at HEAD
+        id: verify-tag
         run: |
-          COMMIT=$(git rev-parse HEAD)
-          COMMIT_SHORT=$(git rev-parse --short HEAD)
-          
-          # Check if HEAD is a tag (preferred, but not required for SIT)
           TAG_AT_HEAD=$(git describe --tags --exact-match HEAD 2>/dev/null || echo "")
           
-          if [ -n "$TAG_AT_HEAD" ]; then
-            echo "✅ Deploying tag: $TAG_AT_HEAD"
-            echo "tag=$TAG_AT_HEAD" >> $GITHUB_OUTPUT
-            echo "is_tag=true" >> $GITHUB_OUTPUT
-          else
-            echo "ℹ️  Deploying commit: $COMMIT_SHORT (not a tag)"
-            echo "tag=" >> $GITHUB_OUTPUT
-            echo "is_tag=false" >> $GITHUB_OUTPUT
+          if [ -z "$TAG_AT_HEAD" ]; then
+            echo "❌ ERROR: SIT branch must point to a deployable tag"
+            echo "   To deploy: git checkout <TAG> && git checkout -B sit && git push origin sit --force"
+            exit 1
           fi
           
-          echo "commit=$COMMIT" >> $GITHUB_OUTPUT
-          echo "commit_short=$COMMIT_SHORT" >> $GITHUB_OUTPUT
+          echo "✅ Deploying tag: $TAG_AT_HEAD"
+          echo "tag=$TAG_AT_HEAD" >> $GITHUB_OUTPUT
+          echo "commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
 
       - name: Set up JDK ${{ env.JAVA_VERSION }}
         uses: actions/setup-java@v4
@@ -65,11 +63,7 @@ jobs:
 
       - name: Build application
         run: |
-          if [ "${{ steps.verify-source.outputs.is_tag }}" = "true" ]; then
-            echo "🔨 Building application from tag ${{ steps.verify-source.outputs.tag }}..."
-          else
-            echo "🔨 Building application from commit ${{ steps.verify-source.outputs.commit_short }}..."
-          fi
+          echo "🔨 Building application from tag ${{ steps.verify-tag.outputs.tag }}..."
           mvn clean package -DskipTests
 
       - name: Prepare deployment package
@@ -81,30 +75,50 @@ jobs:
             echo "❌ ERROR: Failed to prepare deployment package"
             exit 1
           fi
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS_SIT }}
+
+      - name: Get App Service hostname
+        id: app-service
+        run: |
+          APP_NAME="${{ env.AZURE_WEBAPP_NAME }}"
+          RESOURCE_GROUP="${{ env.AZURE_RESOURCE_GROUP }}"
           
-          echo "✅ Deployment package prepared: deploy/app.jar"
-          echo "📦 JAR size: $(du -h deploy/app.jar | cut -f1)"
-
-      - name: Simulate deployment to SIT
-        run: |
-          echo "🚀 [PLACEHOLDER] Deploying to SIT environment..."
-          if [ "${{ steps.verify-source.outputs.is_tag }}" = "true" ]; then
-            echo "   Tag: ${{ steps.verify-source.outputs.tag }}"
-          else
-            echo "   Commit: ${{ steps.verify-source.outputs.commit_short }}"
+          if ! az webapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" >/dev/null 2>&1; then
+            echo "❌ ERROR: App Service '$APP_NAME' not found"
+            exit 1
           fi
-          echo "   Full Commit: ${{ steps.verify-source.outputs.commit }}"
-          echo "   Environment: SIT"
-          echo "   Package: deploy/app.jar"
-          echo "   Profile: sit"
-          echo ""
-          echo "✅ [PLACEHOLDER] Deployment to SIT completed successfully"
-          echo "   In a real scenario, this would deploy to Azure App Service or similar platform"
+          
+          HOSTNAME=$(az webapp show --name "$APP_NAME" --resource-group "$RESOURCE_GROUP" --query "defaultHostName" -o tsv 2>/dev/null || echo "$APP_NAME.azurewebsites.net")
+          echo "hostname=$HOSTNAME" >> $GITHUB_OUTPUT
 
-      - name: Simulate health check
+      - name: Deploy to Azure App Service
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
+          package: deploy/app.jar
+          slot-name: ''  # Deploy directly to production slot (no deployment slots for SIT)
+          startup-command: 'java -jar /home/site/wwwroot/app.jar --spring.profiles.active=sit'
+
+      - name: Verify deployment health
         run: |
-          echo "🔍 [PLACEHOLDER] Verifying SIT deployment health..."
-          sleep 2
-          echo "✅ [PLACEHOLDER] Health check passed"
-          echo "   Endpoint: /actuator/health"
-          echo "   Status: UP"
+          HOSTNAME="${{ steps.app-service.outputs.hostname }}"
+          HEALTH_URL="https://${HOSTNAME}/actuator/health"
+          
+          sleep 15
+          for i in $(seq 1 15); do
+            http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$HEALTH_URL" 2>/dev/null || echo "000")
+            
+            if [ "$http_code" = "200" ]; then
+              echo "✅ Deployment verified - Tag: ${{ steps.verify-tag.outputs.tag }}"
+              exit 0
+            fi
+            
+            [ $i -lt 15 ] && sleep 8
+          done
+          
+          echo "❌ Health check failed after 15 attempts"
+          exit 1
